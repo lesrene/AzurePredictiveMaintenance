@@ -1,0 +1,181 @@
+---
+title: "maint_BayesianML"
+output: html_document
+date: "2025-12-03"
+---
+
+```{r}
+# ---- 0. Libraries ----
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(survival)
+library(brms)
+library(fastDummies)
+
+# ---- 1. Load CSVs ----
+errors      <- read.csv("PdM_errors.csv")
+failures    <- read.csv("PdM_failures.csv")
+machines    <- read.csv("PdM_machines.csv")
+maintenance <- read.csv("PdM_maint.csv")
+telemetry   <- read.csv("PdM_telemetry.csv")
+```
+
+```{r}
+# ---- 2. Failure matrix: rating_data ----
+new_failures <- failures %>% select(-datetime)
+
+rating_data <- new_failures %>%
+  count(machineID, failure) %>%
+  pivot_wider(
+    names_from  = failure,
+    values_from = n,
+    values_fill = 0
+  )
+
+head(rating_data)
+```
+
+```{r}
+# ---- 3. Error features: machine x errorID ----
+errors$count <- 1
+
+error_features <- errors %>%
+  group_by(machineID, errorID) %>%
+  summarise(count = sum(count), .groups = "drop") %>%
+  pivot_wider(
+    names_from  = errorID,
+    values_from = count,
+    values_fill = 0
+  )
+
+head(error_features)
+```
+
+```{r}
+# ---- 4. Telemetry aggregation ----
+telemetry_agg <- telemetry %>%
+  group_by(machineID) %>%
+  summarise(
+    volt      = mean(volt, na.rm = TRUE),
+    rotate    = mean(rotate, na.rm = TRUE),
+    pressure  = mean(pressure, na.rm = TRUE),
+    vibration = mean(vibration, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+head(telemetry_agg)
+```
+
+```{r}
+# ---- 5. Machine features + dummy-encoded model ----
+machine_features <- machines %>%
+  left_join(error_features, by = "machineID") %>%
+  left_join(telemetry_agg,   by = "machineID")
+
+# ensure model is factor
+machine_features$model <- as.factor(machine_features$model)
+
+# R equivalent of pd.get_dummies(machine_features, columns=["model"], drop_first=False)
+machine_features <- fastDummies::dummy_cols(
+  machine_features,
+  select_columns          = "model",
+  remove_selected_columns = FALSE,  # keep original 'model' column
+  remove_first_dummy      = FALSE   # keep all model dummies
+)
+
+head(machine_features)
+```
+
+```{r}
+# ---- 6. Component features from maintenance ----
+maintenance$total_maint_count <- 1
+maintenance$datetime <- as.POSIXct(maintenance$datetime)
+
+# counts
+maint_counts <- maintenance %>%
+  group_by(machineID, comp) %>%
+  summarise(total_maint_count = sum(total_maint_count), .groups = "drop")
+
+# recency
+CURRENT_DATE <- max(maintenance$datetime)
+
+recency_dates <- maintenance %>%
+  group_by(machineID, comp) %>%
+  summarise(last_maintenance_date = max(datetime), .groups = "drop") %>%
+  mutate(
+    how_recent = as.numeric(difftime(CURRENT_DATE, last_maintenance_date, units = "days"))
+  )
+
+# final component_features
+component_features <- maint_counts %>%
+  inner_join(recency_dates, by = c("machineID", "comp"))
+
+head(component_features)
+```
+
+```{r}
+# ---- 7. component_features_df: per (machine, comp) with machine + component info ----
+component_features_df <- component_features %>%
+  rename(
+    Maint_Count      = total_maint_count,
+    Time_Since_Maint = how_recent
+  ) %>%
+  left_join(machine_features, by = "machineID")
+
+head(component_features_df)
+```
+
+```{r}
+# ---- 8. Survival intervals: failures + maintenance ----
+
+# Ensure datetime types
+failures$datetime    <- as.POSIXct(failures$datetime)
+maintenance$datetime <- as.POSIXct(maintenance$datetime)
+
+# Stack failures + maintenance
+all_events <- bind_rows(
+  failures %>%
+    transmute(
+      machineID,
+      comp = failure,
+      datetime,
+      Event_Status = 1L   # failure = event
+    ),
+  maintenance %>%
+    transmute(
+      machineID,
+      comp,
+      datetime,
+      Event_Status = 0L   # maintenance = censored
+    )
+) %>%
+  arrange(machineID, comp, datetime)
+
+# Build intervals
+survival_data_base <- all_events %>%
+  group_by(machineID, comp) %>%
+  arrange(datetime, .by_group = TRUE) %>%
+  mutate(
+    start_time = lag(datetime),
+    T_End      = as.numeric(difftime(datetime, start_time, units = "hours"))
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(T_End), T_End > 0)
+
+head(survival_data_base)
+```
+
+```{r}
+# ---- 9. Join features onto survival intervals ----
+survival_data_final <- survival_data_base %>%
+  left_join(
+    component_features_df,
+    by = c("machineID", "comp")
+  ) %>%
+  mutate(
+    Event_Status = as.integer(Event_Status)   # 1 = event, 0 = censored
+  )
+
+glimpse(survival_data_final)
+```
