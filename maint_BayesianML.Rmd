@@ -5,15 +5,15 @@ date: "2025-12-03"
 ---
 
 ```{r}
-# ---- 0. Libraries ----
 library(dplyr)
 library(tidyr)
+library(data.table)
 library(lubridate)
 library(survival)
 library(brms)
-library(fastDummies)
+```
 
-# ---- 1. Load CSVs ----
+```{r}
 errors      <- read.csv("PdM_errors.csv")
 failures    <- read.csv("PdM_failures.csv")
 machines    <- read.csv("PdM_machines.csv")
@@ -22,22 +22,6 @@ telemetry   <- read.csv("PdM_telemetry.csv")
 ```
 
 ```{r}
-# ---- 2. Failure matrix: rating_data ----
-new_failures <- failures %>% select(-datetime)
-
-rating_data <- new_failures %>%
-  count(machineID, failure) %>%
-  pivot_wider(
-    names_from  = failure,
-    values_from = n,
-    values_fill = 0
-  )
-
-head(rating_data)
-```
-
-```{r}
-# ---- 3. Error features: machine x errorID ----
 errors$count <- 1
 
 error_features <- errors %>%
@@ -53,50 +37,26 @@ head(error_features)
 ```
 
 ```{r}
-# ---- 4. Telemetry aggregation ----
-telemetry_agg <- telemetry %>%
-  group_by(machineID) %>%
-  summarise(
-    volt      = mean(volt, na.rm = TRUE),
-    rotate    = mean(rotate, na.rm = TRUE),
-    pressure  = mean(pressure, na.rm = TRUE),
-    vibration = mean(vibration, na.rm = TRUE),
-    .groups   = "drop"
-  )
-
-head(telemetry_agg)
-```
-
-```{r}
-# ---- 5. Machine features + dummy-encoded model ----
 machine_features <- machines %>%
-  left_join(error_features, by = "machineID") %>%
-  left_join(telemetry_agg,   by = "machineID")
+  left_join(error_features, by = "machineID")
 
-# ensure model is factor
+# ensure model is treated as a factor
 machine_features$model <- as.factor(machine_features$model)
-
-# R equivalent of pd.get_dummies(machine_features, columns=["model"], drop_first=False)
-machine_features <- fastDummies::dummy_cols(
-  machine_features,
-  select_columns          = "model",
-  remove_selected_columns = FALSE,  # keep original 'model' column
-  remove_first_dummy      = FALSE   # keep all model dummies
-)
 
 head(machine_features)
 ```
 
 ```{r}
-# ---- 6. Component features from maintenance ----
 maintenance$total_maint_count <- 1
 maintenance$datetime <- as.POSIXct(maintenance$datetime)
 
-# counts
+# counts of total times each component in each machine got maintained
 maint_counts <- maintenance %>%
   group_by(machineID, comp) %>%
   summarise(total_maint_count = sum(total_maint_count), .groups = "drop")
+```
 
+```{r}
 # recency
 CURRENT_DATE <- max(maintenance$datetime)
 
@@ -109,13 +69,13 @@ recency_dates <- maintenance %>%
 
 # final component_features
 component_features <- maint_counts %>%
-  inner_join(recency_dates, by = c("machineID", "comp"))
+  inner_join(recency_dates %>% select(-last_maintenance_date),
+               by = c("machineID", "comp"))
 
 head(component_features)
 ```
 
 ```{r}
-# ---- 7. component_features_df: per (machine, comp) with machine + component info ----
 component_features_df <- component_features %>%
   rename(
     Maint_Count      = total_maint_count,
@@ -126,14 +86,14 @@ component_features_df <- component_features %>%
 head(component_features_df)
 ```
 
-```{r}
-# ---- 8. Survival intervals: failures + maintenance ----
 
-# Ensure datetime types
+```{r}
+# makes sure they are datetime objects
 failures$datetime    <- as.POSIXct(failures$datetime)
 maintenance$datetime <- as.POSIXct(maintenance$datetime)
 
-# Stack failures + maintenance
+# combine failures + maintenance tables
+# treat failures as 1 (what we're looking for) and maintenance as 0 (reset the clock)
 all_events <- bind_rows(
   failures %>%
     transmute(
@@ -151,8 +111,9 @@ all_events <- bind_rows(
     )
 ) %>%
   arrange(machineID, comp, datetime)
+```
 
-# Build intervals
+```{r}
 survival_data_base <- all_events %>%
   group_by(machineID, comp) %>%
   arrange(datetime, .by_group = TRUE) %>%
@@ -163,26 +124,45 @@ survival_data_base <- all_events %>%
   ungroup() %>%
   filter(!is.na(T_End), T_End > 0)
 
-head(survival_data_base)
+survival_data_base
 ```
 
 ```{r}
-# ---- 9. Join features onto survival intervals ----
-survival_data_final <- survival_data_base %>%
+telemetry$datetime <- as.POSIXct(telemetry$datetime)
+survival_data <- copy(survival_data_base)
+setDT(survival_data)
+setDT(telemetry)
+
+survival_data_base2 <- telemetry[
+  survival_data, 
+  on = .(machineID, datetime > start_time, datetime <= datetime)
+][,
+  .(avg_volt_interval = mean(volt, na.rm = TRUE),
+    avg_rotate_interval = mean(rotate, na.rm = TRUE),
+    avg_pressure_interval = mean(pressure, na.rm = TRUE),
+    avg_vibration_interval = mean(vibration, na.rm = TRUE)),
+  by = .(machineID, comp, Event_Status, datetime, T_End)
+]
+survival_data_base2
+```
+
+```{r}
+survival_data_final <- survival_data_base2 %>%
+  select(-datetime) %>%
   left_join(
     component_features_df,
     by = c("machineID", "comp")
   ) %>%
   mutate(
-    Event_Status = as.integer(Event_Status)   # 1 = event, 0 = censored
+    Event_Status = as.integer(Event_Status) 
   )
-
+survival_data_final
+```
+```{r}
 glimpse(survival_data_final)
 ```
 
 ```{r}
-# ---- 10. Bayesian Cox PH model with brms ----
-
 # Event_Status: 1 = failure (event), 0 = censored
 # brms expects censored = 1, event = 0 inside cens()
 # so we pass cens(1 - Event_Status)
@@ -216,12 +196,13 @@ summary(bayes_surv_brms)
 plot(bayes_surv_brms, regex_pars = "b_")
 
 ```
+
+
 ```{r}
-# ---- 11. Predict & rank components for a specific machine ----
+# predict for a particular machine
+target_machine_id <- 42 
 
-target_machine_id <- 42  # change to any machineID you care about
-
-# Build newdata: one row per (this machine, each component)
+# build newdata: one row per (this machine, each component)
 target_newdata <- component_features_df %>%
   filter(machineID == target_machine_id) %>%
   select(
@@ -237,17 +218,17 @@ target_newdata <- component_features_df %>%
     Event_Status = 1L
   )
 
-# Posterior relative risk (exp(linear predictor)) for each component
+# posterior relative risk (exp(linear predictor)) for each component
 risk_posterior <- posterior_linpred(
   bayes_surv_brms,
   newdata   = target_newdata,
   transform = TRUE   
 )
 
-# Posterior mean relative risk per component
+# posterior mean relative risk per component
 Relative_Risk_Score <- apply(risk_posterior, 2, mean)
 
-# Build ranking table
+# build ranking table
 risk_ranking <- target_newdata %>%
   mutate(Relative_Risk_Score = Relative_Risk_Score) %>%
   arrange(desc(Relative_Risk_Score))
