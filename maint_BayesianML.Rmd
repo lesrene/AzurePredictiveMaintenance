@@ -179,3 +179,78 @@ survival_data_final <- survival_data_base %>%
 
 glimpse(survival_data_final)
 ```
+
+```{r}
+# ---- 10. Bayesian Cox PH model with brms ----
+
+# Event_Status: 1 = failure (event), 0 = censored
+# brms expects censored = 1, event = 0 inside cens()
+# so we pass cens(1 - Event_Status)
+
+model_formula_aligned <- bf(
+  T_End | cens(1 - Event_Status) ~ 
+    age +
+    volt + rotate + pressure + vibration +
+    Maint_Count +
+    Time_Since_Maint
+)
+
+set.seed(42)
+
+bayes_surv_brms <- brm(
+  formula = model_formula_aligned,
+  family  = brmsfamily("cox"),
+  data    = survival_data_final,
+  prior   = prior(normal(0, 1), class = "b"),
+  chains  = 4,
+  iter    = 2000,
+  cores   = 4
+)
+
+summary(bayes_surv_brms)
+```
+
+
+```{r}
+
+plot(bayes_surv_brms, regex_pars = "b_")
+
+```
+```{r}
+# ---- 11. Predict & rank components for a specific machine ----
+
+target_machine_id <- 42  # change to any machineID you care about
+
+# Build newdata: one row per (this machine, each component)
+target_newdata <- component_features_df %>%
+  filter(machineID == target_machine_id) %>%
+  select(
+    machineID,
+    comp,
+    age,
+    volt, rotate, pressure, vibration,
+    Maint_Count,
+    Time_Since_Maint
+  ) %>%
+  mutate(
+    T_End        = 1,
+    Event_Status = 1L
+  )
+
+# Posterior relative risk (exp(linear predictor)) for each component
+risk_posterior <- posterior_linpred(
+  bayes_surv_brms,
+  newdata   = target_newdata,
+  transform = TRUE   
+)
+
+# Posterior mean relative risk per component
+Relative_Risk_Score <- apply(risk_posterior, 2, mean)
+
+# Build ranking table
+risk_ranking <- target_newdata %>%
+  mutate(Relative_Risk_Score = Relative_Risk_Score) %>%
+  arrange(desc(Relative_Risk_Score))
+
+print(risk_ranking)
+```
