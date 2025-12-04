@@ -37,11 +37,35 @@ head(error_features)
 ```
 
 ```{r}
-machine_features <- machines %>%
-  left_join(error_features, by = "machineID")
+# telemetry aggregation
+telemetry_agg <- telemetry %>%
+  group_by(machineID) %>%
+  summarise(
+    volt      = mean(volt, na.rm = TRUE),
+    rotate    = mean(rotate, na.rm = TRUE),
+    pressure  = mean(pressure, na.rm = TRUE),
+    vibration = mean(vibration, na.rm = TRUE),
+    .groups   = "drop"
+  )
 
-# ensure model is treated as a factor
+head(telemetry_agg)
+```
+
+```{r}
+machine_features <- machines %>%
+  left_join(error_features, by = "machineID") %>%
+  left_join(telemetry_agg,   by = "machineID")
+
+# ensure model is factor
 machine_features$model <- as.factor(machine_features$model)
+
+# R equivalent of pd.get_dummies(machine_features, columns=["model"], drop_first=False)
+machine_features <- fastDummies::dummy_cols(
+  machine_features,
+  select_columns          = "model",
+  remove_selected_columns = FALSE,  # keep original 'model' column
+  remove_first_dummy      = FALSE   # keep all model dummies
+)
 
 head(machine_features)
 ```
@@ -170,7 +194,7 @@ glimpse(survival_data_final)
 model_formula_aligned <- bf(
   T_End | cens(1 - Event_Status) ~ 
     age +
-    volt + rotate + pressure + vibration +
+    avg_volt_interval + avg_rotate_interval + avg_pressure_interval + avg_vibration_interval +
     Maint_Count +
     Time_Since_Maint
 )
@@ -203,13 +227,13 @@ plot(bayes_surv_brms, regex_pars = "b_")
 target_machine_id <- 42 
 
 # build newdata: one row per (this machine, each component)
-target_newdata <- component_features_df %>%
+target_newdata <- survival_data_final %>%
   filter(machineID == target_machine_id) %>%
   select(
     machineID,
     comp,
     age,
-    volt, rotate, pressure, vibration,
+    avg_volt_interval, avg_rotate_interval, avg_pressure_interval, avg_vibration_interval,
     Maint_Count,
     Time_Since_Maint
   ) %>%
