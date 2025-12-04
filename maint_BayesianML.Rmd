@@ -229,6 +229,9 @@ target_machine_id <- 42
 # build newdata: one row per (this machine, each component)
 target_newdata <- survival_data_final %>%
   filter(machineID == target_machine_id) %>%
+  group_by(machineID, comp) %>%
+  slice_tail(n = 1) %>%   # use most recent interval
+  ungroup() %>%
   select(
     machineID,
     comp,
@@ -238,7 +241,7 @@ target_newdata <- survival_data_final %>%
     Time_Since_Maint
   ) %>%
   mutate(
-    T_End        = 1,
+    T_End = 1,
     Event_Status = 1L
   )
 
