@@ -1,6 +1,8 @@
 ---
 title: "maint_BayesianML"
-output: html_document
+output:
+  html_document: default
+  pdf_document: default
 date: "2025-12-03"
 ---
 
@@ -205,7 +207,7 @@ bayes_surv_brms <- brm(
   formula = model_formula_aligned,
   family  = brmsfamily("cox"),
   data    = survival_data_final,
-  prior   = prior(normal(0, 1), class = "b"),
+  prior   = prior(normal(0, 0.5), class = "b"),
   chains  = 4,
   iter    = 2000,
   cores   = 4
@@ -213,10 +215,30 @@ bayes_surv_brms <- brm(
 
 summary(bayes_surv_brms)
 ```
+```{r}
+# model accuracy: Concordance Index (C-index)
+library(survival)
 
+# posterior linear predictor (log-hazard) for each row in survival_data_final
+lp_draws <- posterior_linpred(
+  bayes_surv_brms,
+  newdata   = survival_data_final,
+  transform = FALSE   # keep on log-hazard scale
+)
+
+# posterior mean risk score per observation
+lp_mean <- colMeans(lp_draws)
+
+# concordance between observed survival times and predicted risk scores
+c_index_result <- concordance(
+  Surv(survival_data_final$T_End, survival_data_final$Event_Status) ~ lp_mean
+)
+
+c_index <- c_index_result$concordance
+c_index
+```
 
 ```{r}
-
 plot(bayes_surv_brms, regex_pars = "b_")
 
 ```
